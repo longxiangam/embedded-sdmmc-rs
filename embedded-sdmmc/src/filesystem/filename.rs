@@ -185,6 +185,92 @@ impl ShortFileName {
         }
         result
     }
+
+    /// Mangle an arbitrary long name into a valid 8.3 short name (upper-case,
+    /// non-ASCII replaced with `_`, `~seq` numeric tail). Used to pair an SFN
+    /// with LFN entries. `seq` resolves collisions; caller must pick a unique one.
+    pub(crate) fn mangle_from_name(name: &str, seq: u32) -> Result<ShortFileName, FilenameError> {
+        if name.is_empty() {
+            return Err(FilenameError::FilenameEmpty);
+        }
+        if seq == 0 {
+            return Err(FilenameError::InvalidCharacter);
+        }
+        // Decimal digit count of `seq` (1..=10). We need this to know how many
+        // base characters we can keep: the on-disk base field is 8 bytes and we
+        // write "<base>~<seq>" into it.
+        let seq_digits = {
+            let mut d = 0u32;
+            let mut n = seq;
+            while n > 0 {
+                d += 1;
+                n /= 10;
+            }
+            d as usize
+        };
+        // 1 byte for the '~' plus the digits must fit in the 8-byte base field.
+        let max_base = match 8usize.checked_sub(1 + seq_digits) {
+            Some(n) if n >= 1 => n,
+            _ => return Err(FilenameError::NameTooLong),
+        };
+
+        // Split into base and extension at the last '.'. A leading dot (as in
+        // ".gitignore") is treated as part of the base name.
+        let (base_str, ext_str) = match name.rfind('.') {
+            Some(pos) if pos > 0 => (&name[..pos], &name[pos + 1..]),
+            _ => (name, ""),
+        };
+
+        let mut contents = [b' '; Self::TOTAL_LEN];
+
+        // Mangled base.
+        let mut bi = 0usize;
+        for ch in base_str.chars() {
+            if bi >= max_base {
+                break;
+            }
+            let up = ch.to_ascii_uppercase();
+            contents[bi] = if up.is_ascii_alphanumeric() { up as u8 } else { b'_' };
+            bi += 1;
+        }
+        if bi == 0 {
+            // The base reduced to nothing (e.g. the name was all dots). Force a
+            // non-empty base so we never emit an empty 8.3 name.
+            contents[0] = b'_';
+            bi = 1;
+        }
+        // Append "~<seq>".
+        contents[bi] = b'~';
+        bi += 1;
+        {
+            let mut digits = [0u8; 10];
+            let mut len = 0usize;
+            let mut n = seq;
+            while n > 0 {
+                digits[len] = b'0' + (n % 10) as u8;
+                len += 1;
+                n /= 10;
+            }
+            for k in (0..len).rev() {
+                contents[bi] = digits[k];
+                bi += 1;
+            }
+        }
+        debug_assert!(bi <= Self::BASE_LEN);
+
+        // Mangled extension (up to 3 chars). Empty extension stays as spaces.
+        let mut ei = 0usize;
+        for ch in ext_str.chars() {
+            if ei >= 3 {
+                break;
+            }
+            let up = ch.to_ascii_uppercase();
+            contents[Self::BASE_LEN + ei] = if up.is_ascii_alphanumeric() { up as u8 } else { b'_' };
+            ei += 1;
+        }
+
+        Ok(ShortFileName { contents })
+    }
 }
 
 impl core::fmt::Display for ShortFileName {

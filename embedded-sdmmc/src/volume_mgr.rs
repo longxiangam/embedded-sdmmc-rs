@@ -726,7 +726,11 @@ where
 
     /// Open a file with the given Unicode long file name, in the given directory.
     ///
-    /// You can only open existing long-file-name files - you cannot create them.
+    /// If a create mode ([`Mode::ReadWriteCreate`], [`Mode::ReadWriteCreateOrAppend`]
+    /// or [`Mode::ReadWriteCreateOrTruncate`]) is given and the file does not yet
+    /// exist, it is created and given `name` as its long file name (with an
+    /// auto-generated, collision-free 8.3 short name). Existing long-file-name
+    /// files can be opened with any mode.
     ///
     /// <div class="warning">
     ///
@@ -756,9 +760,8 @@ where
         let directory_idx = data.get_dir_by_id(directory)?;
         let volume_id = data.open_dirs[directory_idx].raw_volume;
         let volume_idx = data.get_volume_by_id(volume_id)?;
-        let volume_info = &data.open_volumes[volume_idx];
 
-        let dir_entry = match &volume_info.volume_type {
+        let found = match &data.open_volumes[volume_idx].volume_type {
             VolumeType::Fat(fat) => fat.find_directory_entry_by_lfn(
                 &mut data.block_cache,
                 &data.open_dirs[directory_idx],
@@ -766,35 +769,68 @@ where
             ),
         };
 
-        let dir_entry = match dir_entry {
-            Ok(entry) => {
-                // we are opening an existing file
-                entry
-            }
+        let dir_entry = match found {
+            Ok(entry) => Some(entry),
             Err(_)
                 if (mode == Mode::ReadWriteCreate)
                     | (mode == Mode::ReadWriteCreateOrTruncate)
                     | (mode == Mode::ReadWriteCreateOrAppend) =>
             {
-                // We are opening a non-existant file and we cannot do that with LFNs
-                return Err(Error::NotFound);
+                // Not found, but a create mode was requested — create it below.
+                None
             }
             _ => {
-                // We are opening a non-existant file, and that's not OK.
+                // We are opening a non-existent file, and that's not OK.
                 return Err(Error::NotFound);
             }
         };
 
-        // Check if it's open already
-        if data.file_is_open(volume_info.raw_volume, &dir_entry) {
-            return Err(Error::FileAlreadyOpen);
+        // Check if it's open already (only meaningful for existing files).
+        if let Some(dir_entry) = dir_entry.as_ref() {
+            if data.file_is_open(volume_id, dir_entry) {
+                return Err(Error::FileAlreadyOpen);
+            }
         }
 
-        let mode = solve_mode_variant(mode, true);
+        let mode = solve_mode_variant(mode, dir_entry.is_some());
 
         match mode {
-            Mode::ReadWriteCreate => Err(Error::FileAlreadyExists),
+            Mode::ReadWriteCreate => {
+                // Create a new file with the given long file name.
+                if dir_entry.is_some() {
+                    return Err(Error::FileAlreadyExists);
+                }
+                let att = Attributes::create_from_fat(0);
+                let entry = match &mut data.open_volumes[volume_idx].volume_type {
+                    VolumeType::Fat(fat) => fat.write_new_directory_entry_with_lfn(
+                        &mut data.block_cache,
+                        &self.time_source,
+                        &data.open_dirs[directory_idx],
+                        name,
+                        att,
+                    )?,
+                };
+                let file_id = RawFile(data.id_generator.generate());
+                let file = FileInfo {
+                    raw_file: file_id,
+                    raw_volume: volume_id,
+                    current_cluster: (0, entry.cluster),
+                    current_offset: 0,
+                    mode,
+                    entry,
+                    dirty: false,
+                };
+                // Remember this open file - can't be full as we checked already
+                unsafe {
+                    data.open_files.push_unchecked(file);
+                }
+                Ok(file_id)
+            }
             _ => {
+                // Opening an existing file. Non-create modes only reach here
+                // when the file was found, so this unwrap is safe.
+                let dir_entry = dir_entry.unwrap();
+
                 if dir_entry.attributes.is_read_only() && mode != Mode::ReadOnly {
                     return Err(Error::ReadOnly);
                 }

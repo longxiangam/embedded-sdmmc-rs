@@ -540,6 +540,271 @@ impl FatVolume {
         }
     }
 
+    /// Pick a short file name, derived from `long_name`, that does not already
+    /// exist in the directory.
+    ///
+    /// Repeatedly mangles `long_name` with an increasing `~seq` suffix until
+    /// [`Fat::find_directory_entry`] reports the candidate as absent.
+    fn generate_unique_sfn<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        dir_info: &DirectoryInfo,
+        long_name: &str,
+    ) -> Result<ShortFileName, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        let mut seq = 1u32;
+        loop {
+            let candidate =
+                ShortFileName::mangle_from_name(long_name, seq).map_err(Error::FilenameError)?;
+            match self.find_directory_entry(block_cache, dir_info, &candidate) {
+                Ok(_) => {
+                    seq += 1;
+                    // `mangle_from_name` accepts up to a 6-digit suffix.
+                    if seq >= 1_000_000 {
+                        return Err(Error::NotEnoughSpace);
+                    }
+                }
+                Err(Error::NotFound) => return Ok(candidate),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Create a new directory entry for a file (or directory) with a long
+    /// file name.
+    ///
+    /// This writes the LFN slot sequence followed by the 8.3 short-name slot,
+    /// all contiguous, allocating fresh directory space (and extending the
+    /// directory with a new cluster if needed). The returned [`DirEntry`]
+    /// refers to the short-name slot.
+    pub(crate) fn write_new_directory_entry_with_lfn<D, T>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        time_source: &T,
+        dir_info: &DirectoryInfo,
+        long_name: &str,
+        attributes: Attributes,
+    ) -> Result<DirEntry, Error<D::Error>>
+    where
+        D: BlockDevice,
+        T: TimeSource,
+    {
+        // Encode the long name as UCS-2 (FAT allows up to 255 UTF-16 code units).
+        let mut utf16 = [0u16; 255];
+        let mut utf16_len = 0usize;
+        for unit in long_name.encode_utf16() {
+            if utf16_len >= utf16.len() {
+                return Err(Error::FilenameError(FilenameError::NameTooLong));
+            }
+            utf16[utf16_len] = unit;
+            utf16_len += 1;
+        }
+        // At least one LFN slot is required when an LFN is present.
+        let num_lfn = ((utf16_len + 12) / 13).max(1);
+        let needed = num_lfn + 1; // LFN slots + SFN slot
+        // 255 code units => 20 LFN slots => 21 total. The run buffer is sized
+        // for this worst case.
+        const MAX_RUN: usize = 21;
+        debug_assert!(needed <= MAX_RUN);
+
+        let sfn = self.generate_unique_sfn(block_cache, dir_info, long_name)?;
+        let checksum = sfn.csum();
+        let ctime = time_source.get_timestamp();
+        let dir_cluster = dir_info.cluster;
+        let fat_type = match &self.fat_specific_info {
+            FatSpecificInfo::Fat16(_) => FatType::Fat16,
+            FatSpecificInfo::Fat32(_) => FatType::Fat32,
+        };
+
+        // Walk the directory, tracking a run of `needed` consecutive free
+        // slots. Free = byte 0 is 0x00 (end-of-directory) or 0xE5 (deleted).
+        let mut run: [(BlockIdx, u32); MAX_RUN] = [(BlockIdx(0), 0); MAX_RUN];
+        let mut run_len = 0usize;
+
+        macro_rules! slot_push {
+            ($block_idx:expr, $off:expr) => {{
+                let block_idx: BlockIdx = $block_idx;
+                let off: u32 = $off;
+                if run_len < needed {
+                    run[run_len] = (block_idx, off);
+                }
+                run_len += 1;
+                if run_len >= needed {
+                    // We have a full run: write the LFN slots + SFN slot.
+                    let (sfn_block, sfn_off) = run[num_lfn];
+                    let entry = DirEntry::new(sfn, attributes, ClusterId::EMPTY, ctime, sfn_block, sfn_off);
+                    Self::write_lfn_and_sfn_slots(
+                        block_cache,
+                        fat_type,
+                        &run[..needed],
+                        num_lfn,
+                        &utf16[..utf16_len],
+                        checksum,
+                        &entry,
+                    )?;
+                    return Ok(entry);
+                }
+            }};
+        }
+        macro_rules! slot_reset {
+            () => {{
+                run_len = 0;
+            }};
+        }
+
+        match &self.fat_specific_info {
+            FatSpecificInfo::Fat16(fat16_info) => {
+                let mut current_cluster = Some(dir_cluster);
+                let mut first_dir_block_num = match dir_cluster {
+                    ClusterId::ROOT_DIR => self.lba_start + fat16_info.first_root_dir_block,
+                    _ => self.cluster_to_block(dir_cluster),
+                };
+                let dir_size = match dir_cluster {
+                    ClusterId::ROOT_DIR => {
+                        let len_bytes =
+                            u32::from(fat16_info.root_entries_count) * OnDiskDirEntry::LEN_U32;
+                        BlockCount::from_bytes(len_bytes)
+                    }
+                    _ => BlockCount(u32::from(self.blocks_per_cluster)),
+                };
+                while let Some(cluster) = current_cluster {
+                    for block_idx in first_dir_block_num.range(dir_size) {
+                        // Scan this block's slots into locals first so the
+                        // immutable block borrow is released before we (may)
+                        // write below.
+                        let mut slot_free = [false; 16];
+                        {
+                            let block = block_cache.read(block_idx).map_err(Error::DeviceError)?;
+                            for i in 0..16 {
+                                let off = i * OnDiskDirEntry::LEN;
+                                let odde = OnDiskDirEntry::new(&block.contents[off..off + OnDiskDirEntry::LEN]);
+                                slot_free[i] = !odde.is_valid();
+                            }
+                        }
+                        for i in 0..16 {
+                            if slot_free[i] {
+                                slot_push!(block_idx, (i * OnDiskDirEntry::LEN) as u32);
+                            } else {
+                                slot_reset!();
+                            }
+                        }
+                    }
+                    if cluster != ClusterId::ROOT_DIR {
+                        current_cluster = match self.next_cluster(block_cache, cluster) {
+                            Ok(n) => {
+                                first_dir_block_num = self.cluster_to_block(n);
+                                Some(n)
+                            }
+                            Err(Error::EndOfFile) => {
+                                let c = self.alloc_cluster(block_cache, Some(cluster), true)?;
+                                first_dir_block_num = self.cluster_to_block(c);
+                                Some(c)
+                            }
+                            _ => None,
+                        };
+                    } else {
+                        current_cluster = None;
+                    }
+                }
+                Err(Error::NotEnoughSpace)
+            }
+            FatSpecificInfo::Fat32(fat32_info) => {
+                let mut current_cluster = match dir_cluster {
+                    ClusterId::ROOT_DIR => Some(fat32_info.first_root_dir_cluster),
+                    _ => Some(dir_cluster),
+                };
+                let mut first_dir_block_num = self.cluster_to_block(dir_cluster);
+                let dir_size = BlockCount(u32::from(self.blocks_per_cluster));
+                while let Some(cluster) = current_cluster {
+                    for block_idx in first_dir_block_num.range(dir_size) {
+                        let mut slot_free = [false; 16];
+                        {
+                            let block = block_cache.read(block_idx).map_err(Error::DeviceError)?;
+                            for i in 0..16 {
+                                let off = i * OnDiskDirEntry::LEN;
+                                let odde = OnDiskDirEntry::new(&block.contents[off..off + OnDiskDirEntry::LEN]);
+                                slot_free[i] = !odde.is_valid();
+                            }
+                        }
+                        for i in 0..16 {
+                            if slot_free[i] {
+                                slot_push!(block_idx, (i * OnDiskDirEntry::LEN) as u32);
+                            } else {
+                                slot_reset!();
+                            }
+                        }
+                    }
+                    current_cluster = match self.next_cluster(block_cache, cluster) {
+                        Ok(n) => {
+                            first_dir_block_num = self.cluster_to_block(n);
+                            Some(n)
+                        }
+                        Err(Error::EndOfFile) => {
+                            let c = self.alloc_cluster(block_cache, Some(cluster), true)?;
+                            first_dir_block_num = self.cluster_to_block(c);
+                            Some(c)
+                        }
+                        _ => None,
+                    };
+                }
+                Err(Error::NotEnoughSpace)
+            }
+        }
+    }
+
+    /// Write the LFN slots and the 8.3 SFN slot at the given contiguous
+    /// directory positions, in physical (on-disk) order.
+    ///
+    /// `positions[0..num_lfn]` receive the LFN slots — entry 0 is the
+    /// physical-first slot, which carries the highest sequence number and the
+    /// `0x40` flag and the *final* characters of the name. `positions[num_lfn]`
+    /// receives the short-name slot.
+    fn write_lfn_and_sfn_slots<D>(
+        block_cache: &mut BlockCache<D>,
+        fat_type: FatType,
+        positions: &[(BlockIdx, u32)],
+        num_lfn: usize,
+        utf16: &[u16],
+        checksum: u8,
+        sfn_entry: &DirEntry,
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        let mut idx = 0;
+        while idx < positions.len() {
+            let block_idx = positions[idx].0;
+            let block = block_cache
+                .read_mut(block_idx)
+                .map_err(Error::DeviceError)?;
+            // Patch every slot of this run that lives in the current block.
+            while idx < positions.len() && positions[idx].0 == block_idx {
+                let off = positions[idx].1 as usize;
+                let bytes = &mut block.contents[off..off + OnDiskDirEntry::LEN];
+                if idx < num_lfn {
+                    let seq_no = num_lfn - idx; // num_lfn, num_lfn-1, ..., 1
+                    let seq_byte = if idx == 0 {
+                        0x40 | (seq_no as u8)
+                    } else {
+                        seq_no as u8
+                    };
+                    let start = (seq_no - 1) * 13;
+                    let end = core::cmp::min(seq_no * 13, utf16.len());
+                    let lfn =
+                        OnDiskDirEntry::serialize_lfn_entry(seq_byte, checksum, &utf16[start..end]);
+                    bytes.copy_from_slice(&lfn);
+                } else {
+                    bytes.copy_from_slice(&sfn_entry.serialize(fat_type));
+                }
+                idx += 1;
+            }
+            block_cache.write_back().map_err(Error::DeviceError)?;
+        }
+        Ok(())
+    }
+
     /// Calls callback `func` with every valid entry in the given directory.
     /// Useful for performing directory listings.
     pub(crate) fn iterate_dir<D, F>(
@@ -911,11 +1176,13 @@ impl FatVolume {
                             // UCS-2 16-bit values are valid Unicode code points - we do not expect surrogate pairs but if we find then, we give up.
                             debug!("Looking at word {:04x}", *word);
                             let Some(c) = char::from_u32(*word as u32) else {
+                                state = SeqState::Waiting;
                                 return ControlFlow::Continue(());
                             };
                             debug!("Looking at char '{}'", c);
                             let Some(r) = remaining.strip_suffix(c) else {
                                 debug!("No, didn't want that");
+                                state = SeqState::Waiting;
                                 return ControlFlow::Continue(());
                             };
                             debug!("Liked it! {:?} is left", r);
@@ -938,6 +1205,9 @@ impl FatVolume {
                                 csum,
                             };
                         }
+                    } else {
+                        // Not the LFN slot we expected; start over.
+                        state = SeqState::Waiting;
                     }
                 }
                 SeqState::Found { csum } => {

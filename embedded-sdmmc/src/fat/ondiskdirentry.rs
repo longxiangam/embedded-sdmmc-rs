@@ -77,6 +77,47 @@ impl<'a> OnDiskDirEntry<'a> {
         attributes.is_lfn()
     }
 
+    /// Build a 32-byte LFN slot (inverse of `lfn_contents`).
+    pub(crate) fn serialize_lfn_entry(seq_byte: u8, checksum: u8, chars: &[u16]) -> [u8; 32] {
+        let mut entry = [0u8; 32];
+        entry[0] = seq_byte;
+        entry[11] = Attributes::LFN;
+        // byte 12: type (0 = LFN). byte 13: checksum.
+        entry[12] = 0x00;
+        entry[13] = checksum;
+        // bytes 26..=27: first cluster, always 0 for an LFN slot.
+
+        // UCS-2 code unit byte offsets within the 32-byte entry, mirroring
+        // `lfn_contents`. Each pair is (lo, hi) of a little-endian u16.
+        const CHAR_OFFSETS: [(usize, usize); 13] = [
+            (1, 2),
+            (3, 4),
+            (5, 6),
+            (7, 8),
+            (9, 10),
+            (14, 15),
+            (16, 17),
+            (18, 19),
+            (20, 21),
+            (22, 23),
+            (24, 25),
+            (28, 29),
+            (30, 31),
+        ];
+        for (i, &(lo, hi)) in CHAR_OFFSETS.iter().enumerate() {
+            let val = if i < chars.len() {
+                chars[i]
+            } else if i == chars.len() {
+                0x0000
+            } else {
+                0xFFFF
+            };
+            entry[lo] = (val & 0xFF) as u8;
+            entry[hi] = ((val >> 8) & 0xFF) as u8;
+        }
+        entry
+    }
+
     /// If this is an LFN, get the contents so we can re-assemble the filename.
     pub fn lfn_contents(&self) -> Option<(bool, u8, u8, [u16; 13])> {
         if self.is_lfn() {

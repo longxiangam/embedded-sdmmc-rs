@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
 
 ## [Unreleased]
 
+### Added
+
+- `open_long_name_file_in_dir` can now _create_ files with a Long File Name when
+  given a create mode (`ReadWriteCreate`, `ReadWriteCreateOrAppend`, or
+  `ReadWriteCreateOrTruncate`). A collision-free 8.3 short name is generated
+  automatically and the LFN directory entries are written alongside it. Works on
+  both FAT16 and FAT32 volumes.
+
+### Changed
+
+- `open_long_name_file_in_dir` no longer returns `NotFound` for create modes on
+  missing files; it creates them instead.
+
 ## [Version 0.10.0] - 2026-07-24
 
 ### Changed
