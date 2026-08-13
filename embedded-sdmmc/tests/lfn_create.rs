@@ -295,3 +295,65 @@ fn find_lfn_after_sibling_with_shared_suffix() {
     volume_mgr.close_dir(root_dir).expect("close dir");
     volume_mgr.close_volume(volume).expect("close volume");
 }
+
+/// Regression: a file stored as a bare 8.3 entry (no LFN slots) must be
+/// openable by `open_long_name_file_in_dir`. Before the fix the matcher
+/// skipped every entry without long-name slots, so plain 8.3 files (e.g.
+/// images copied straight onto the card) were reported `NotFound` even
+/// though they appeared in directory listings.
+#[test]
+fn open_bare_8_3_file_by_name() {
+    use embedded_sdmmc::{Block, BlockDevice, BlockIdx};
+    let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
+    const ROOT_DIR_BLOCK: u32 = 265760; // FAT32 root dir sector on this image
+
+    // A single bare SFN entry — no preceding LFN slots. Empty file
+    // (cluster/size 0), archive attribute.
+    let mut entry = [0u8; 32];
+    entry[0..11].copy_from_slice(b"BAREFILETXT");
+    entry[11] = 0x20;
+
+    // Find a free root-dir slot and write the entry into it.
+    let mut block = Block::new();
+    let mut inject_block = ROOT_DIR_BLOCK;
+    let mut slot = None;
+    for blk_off in 0..4 {
+        let b = ROOT_DIR_BLOCK + blk_off;
+        BlockDevice::read(&disk, core::slice::from_mut(&mut block), BlockIdx(b))
+            .expect("read root dir block");
+        for i in 0..16 {
+            let bb = block.contents[i * 32];
+            if bb == 0x00 || bb == 0xE5 {
+                slot = Some(i);
+                break;
+            }
+        }
+        if slot.is_some() {
+            inject_block = b;
+            break;
+        }
+    }
+    let slot = slot.expect("free root-dir entry");
+    block.contents[slot * 32..(slot + 1) * 32].copy_from_slice(&entry);
+    BlockDevice::write(&disk, core::slice::from_ref(&block), BlockIdx(inject_block))
+        .expect("write root dir");
+
+    let volume_mgr: Vm =
+        VolumeManager::new_with_limits(disk, utils::make_time_source(), 0xAA00_0000);
+    let volume = volume_mgr.open_raw_volume(VolumeIdx(1)).expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+
+    // Found by name, case-insensitively, despite having no LFN slots.
+    let f = volume_mgr
+        .open_long_name_file_in_dir(root_dir, "BAREFILE.TXT", Mode::ReadOnly)
+        .expect("open bare 8.3 file by name");
+    volume_mgr.close_file(f).expect("close");
+    // Also reachable via a lower-case request.
+    let f = volume_mgr
+        .open_long_name_file_in_dir(root_dir, "barefile.txt", Mode::ReadOnly)
+        .expect("open bare 8.3 file by lower-case name");
+    volume_mgr.close_file(f).expect("close");
+
+    volume_mgr.close_dir(root_dir).expect("close dir");
+    volume_mgr.close_volume(volume).expect("close volume");
+}

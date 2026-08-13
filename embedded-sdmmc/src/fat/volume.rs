@@ -1146,6 +1146,20 @@ impl FatVolume {
                                 csum,
                             };
                         }
+                    } else if !odde.is_lfn() {
+                        // A bare 8.3 entry with no long-name slots. Try to
+                        // match the requested name as a short file name
+                        // (case-insensitive: `create_from_str` upper-cases).
+                        // Files that carry a long name are matched by the
+                        // LFN branch above; this only covers names stored as
+                        // plain 8.3 (e.g. images copied to the card directly,
+                        // which have no LFN entries on disk).
+                        if let Ok(sfn) = ShortFileName::create_from_str(match_name) {
+                            if de.name == sfn {
+                                result = Ok(de.clone());
+                                return ControlFlow::Break(());
+                            }
+                        }
                     }
                 }
                 SeqState::Scanning {
